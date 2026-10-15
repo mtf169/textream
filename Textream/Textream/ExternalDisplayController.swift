@@ -124,6 +124,7 @@ struct ExternalDisplayView: View {
 
     // Timer-based scroll for classic & silence-paused modes
     @State private var timerWordProgress: Double = 0
+    @State private var jumpRequest = 0
     @State private var isUserScrolling: Bool = false
     @State private var countdownRemaining: Int = 0
     @State private var countdownTimer: Timer? = nil
@@ -200,6 +201,10 @@ struct ExternalDisplayView: View {
                     .padding(.trailing, 40)
             }
         }
+        .overlay(alignment: .top) {
+            PrompterHUDView()
+                .animation(.easeInOut(duration: 0.2), value: PrompterControls.shared.hudText)
+        }
         .scaleEffect(x: mirrorAxis?.scaleX ?? 1, y: mirrorAxis?.scaleY ?? 1)
         .animation(.easeInOut(duration: 0.5), value: isDone)
         .onChange(of: isDone) { _, done in
@@ -228,6 +233,18 @@ struct ExternalDisplayView: View {
             case .wordTracking:
                 break
             }
+        }
+        .onChange(of: PrompterControls.shared.stepID) { _, _ in
+            if listeningMode != .wordTracking {
+                let target = PrompterNavigation.targetWordIndex(
+                    words: words,
+                    currentWord: Int(timerWordProgress),
+                    step: PrompterControls.shared.lastStep
+                )
+                timerWordProgress = Double(target)
+                isUserScrolling = false
+            }
+            jumpRequest &+= 1
         }
         .onChange(of: content.currentPageIndex) { _, _ in
             timerWordProgress = 0
@@ -263,7 +280,12 @@ struct ExternalDisplayView: View {
                     onManualScroll: { scrolling, newProgress in
                         isUserScrolling = scrolling
                         if !scrolling {
-                            timerWordProgress = max(0, min(Double(words.count), newProgress))
+                            if listeningMode == .wordTracking {
+                                let index = max(0, min(words.count, Int(newProgress)))
+                                speechRecognizer.jumpTo(charOffset: PrompterNavigation.charOffset(forWordIndex: index, in: words))
+                            } else {
+                                timerWordProgress = max(0, min(Double(words.count), newProgress))
+                            }
                         }
                     },
                     smoothScroll: listeningMode != .wordTracking,
@@ -272,7 +294,8 @@ struct ExternalDisplayView: View {
                     readingPosition: NotchSettings.shared.readingPosition,
                 paragraphBreakBeforeWordIndices: NotchSettings.shared.showParagraphDividers
                     ? content.paragraphBreakBeforeWordIndices
-                    : []
+                    : [],
+                jumpRequestID: jumpRequest
             )
             .id(content.currentPageIndex)
             .padding(.horizontal, textPad)

@@ -138,6 +138,9 @@ struct SpeechScrollView: View {
     /// Optional preview-only transition. Live overlays keep their existing behavior.
     var readingPositionTransitionDuration: Double? = nil
     var paragraphBreakBeforeWordIndices: Set<Int> = []
+    /// Bump to re-anchor on the current position after a keyboard jump,
+    /// including jumps backward, which tracking normally ignores.
+    var jumpRequestID: Int = 0
     @State private var scrollOffset: CGFloat = 0
     @State private var manualOffset: CGFloat = 0
     @State private var wordYPositions: [Int: CGFloat] = [:]
@@ -227,8 +230,14 @@ struct SpeechScrollView: View {
                     recalculateTracking(containerHeight: newHeight)
                 }
             }
+            .onChange(of: jumpRequestID) { _, _ in
+                manualOffset = 0
+                isUserScrolling = false
+                allowsNextBackwardTrackingUpdate = true
+                recalculateTracking(containerHeight: containerHeight)
+            }
             .onChange(of: highlightedCharCount) { _, _ in
-                if isListening && !smoothScroll {
+                if isListening && !smoothScroll && !isUserScrolling {
                     manualOffset = 0
                     recalculateTracking(containerHeight: containerHeight)
                 }
@@ -294,11 +303,15 @@ struct SpeechScrollView: View {
             .overlay(
                 ScrollWheelView(
                     onScroll: { delta in
-                        let canScroll = smoothScroll ? isListening : !isListening
+                        // Smooth modes scroll only while running. Word tracking
+                        // scrolls while paused (to browse) and while listening
+                        // (to move the reading position).
+                        let canScroll = smoothScroll ? isListening : true
                         guard canScroll else { return }
 
-                        // Pause timer when user starts scrolling in smooth mode
-                        if smoothScroll && !isUserScrolling {
+                        // While running, scrolling pauses tracking and moves the
+                        // reading position when it ends
+                        if isListening && !isUserScrolling {
                             isUserScrolling = true
                             onManualScroll?(true, 0)
                         }
@@ -323,7 +336,7 @@ struct SpeechScrollView: View {
                         }
                     },
                     onScrollEnd: {
-                        if smoothScroll && isUserScrolling {
+                        if isListening && isUserScrolling {
                             // Find the word at the active tracking anchor.
                             let newProgress = wordProgressAtCurrentOffset()
                             withAnimation(.easeOut(duration: 0.15)) {
@@ -975,6 +988,8 @@ class ScrollWheelNSView: NSView {
     var onScroll: ((CGFloat) -> Void)?
     var onScrollEnd: (() -> Void)?
     private var scrollMonitor: Any?
+    /// A mouse wheel sends no end phase, so treat a short pause as the end.
+    private var wheelEndWorkItem: DispatchWorkItem?
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -989,6 +1004,11 @@ class ScrollWheelNSView: NSView {
 
                     if event.phase == .ended || event.momentumPhase == .ended {
                         self.onScrollEnd?()
+                    } else if event.phase.isEmpty && event.momentumPhase.isEmpty {
+                        self.wheelEndWorkItem?.cancel()
+                        let workItem = DispatchWorkItem { [weak self] in self?.onScrollEnd?() }
+                        self.wheelEndWorkItem = workItem
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
                     }
                 }
                 return event
@@ -997,6 +1017,7 @@ class ScrollWheelNSView: NSView {
     }
 
     override func removeFromSuperview() {
+        wheelEndWorkItem?.cancel()
         if let monitor = scrollMonitor {
             NSEvent.removeMonitor(monitor)
             scrollMonitor = nil

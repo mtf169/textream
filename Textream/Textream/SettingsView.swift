@@ -471,7 +471,7 @@ struct SettingsView: View {
             }
             .frame(maxWidth: .infinity)
         }
-        .frame(width: 500)
+        .frame(width: 580)
         .frame(minHeight: 280, maxHeight: 500)
         .background(.ultraThinMaterial)
         .alert("Reset All Settings?", isPresented: $showResetConfirmation) {
@@ -757,6 +757,7 @@ struct SettingsView: View {
     // MARK: - Guidance Tab
 
     private var guidanceTab: some View {
+        ScrollView(.vertical, showsIndicators: false) {
         VStack(alignment: .leading, spacing: 14) {
             Picker("", selection: $settings.listeningMode) {
                 ForEach(ListeningMode.allCases) { mode in
@@ -831,9 +832,9 @@ struct SettingsView: View {
                 }
             }
 
-            Spacer()
         }
         .padding(16)
+        }
         .onAppear { availableMics = AudioInputDevice.allInputDevices() }
     }
 
@@ -1170,13 +1171,19 @@ struct SettingsView: View {
                 )
             }
 
-            Text("Wider margins make shorter lines, so your eyes move less on camera. Changes show live.")
+            Text("Wider margins make shorter lines, so your eyes move less on camera.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
+
+            Text("While the prompter runs: \u{2318}+ / \u{2318}\u{2212} text size, \u{2318}[ / \u{2318}] margins, \u{2191} \u{2193} sentence, \u{2190} \u{2192} word. Scroll over the prompter to move the reading position.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
     private var externalTab: some View {
+        ScrollView(.vertical, showsIndicators: false) {
         VStack(alignment: .leading, spacing: 14) {
             Text("Show the teleprompter on an external display or Sidecar iPad.")
                 .font(.system(size: 11))
@@ -1230,9 +1237,9 @@ struct SettingsView: View {
 
                 fullscreenTextControls
             }
-            Spacer()
         }
         .padding(16)
+        }
         .onAppear { refreshScreens() }
     }
 
