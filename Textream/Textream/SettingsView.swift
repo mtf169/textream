@@ -1047,6 +1047,8 @@ struct SettingsView: View {
                         onRefresh: { refreshOverlayScreens() }
                     )
 
+                    fullscreenTextControls
+
                     HStack(spacing: 6) {
                         Image(systemName: "escape")
                             .font(.system(size: 11, weight: .semibold))
@@ -1129,6 +1131,51 @@ struct SettingsView: View {
 
     @State private var availableScreens: [NSScreen] = []
 
+    private var fullscreenTextControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Fullscreen Text")
+                .font(.system(size: 13, weight: .medium))
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Text Size")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(Int((settings.fullscreenTextScale * 100).rounded()))%")
+                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                Slider(
+                    value: $settings.fullscreenTextScale,
+                    in: NotchSettings.fullscreenTextScaleRange,
+                    step: 0.05
+                )
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Side Margins")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(Int((settings.fullscreenSideMargin * 100).rounded()))% each side")
+                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                Slider(
+                    value: $settings.fullscreenSideMargin,
+                    in: NotchSettings.fullscreenSideMarginRange,
+                    step: 0.01
+                )
+            }
+
+            Text("Wider margins make shorter lines, so your eyes move less on camera. Changes show live.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+    }
+
     private var externalTab: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Show the teleprompter on an external display or Sidecar iPad.")
@@ -1178,6 +1225,10 @@ struct SettingsView: View {
                     onRefresh: { refreshScreens() },
                     emptyMessage: "No external displays detected. Connect a display or enable Sidecar."
                 )
+
+                Divider()
+
+                fullscreenTextControls
             }
             Spacer()
         }
@@ -1528,6 +1579,8 @@ struct SettingsView: View {
         settings.overlayTransparencyOpacity = 0.85
         settings.followCursorWhenUndocked = false
         settings.fullscreenScreenID = 0
+        settings.fullscreenTextScale = NotchSettings.defaultFullscreenTextScale
+        settings.fullscreenSideMargin = NotchSettings.defaultFullscreenSideMargin
         settings.externalDisplayMode = .off
         settings.externalScreenID = 0
         settings.mirrorAxis = .horizontal

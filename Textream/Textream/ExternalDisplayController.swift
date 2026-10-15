@@ -238,8 +238,9 @@ struct ExternalDisplayView: View {
 
     private var prompterView: some View {
         GeometryReader { geo in
-            let fontSize = max(48, min(96, geo.size.width / 14))
+            let fontSize = max(48, min(96, geo.size.width / 14)) * NotchSettings.shared.fullscreenTextScale
             let hPad = max(40, geo.size.width * 0.08)
+            let textPad = max(40, geo.size.width * NotchSettings.shared.fullscreenSideMargin)
 
             VStack(spacing: 0) {
                 Spacer().frame(height: 20)
@@ -274,7 +275,7 @@ struct ExternalDisplayView: View {
                     : []
             )
             .id(content.currentPageIndex)
-            .padding(.horizontal, hPad)
+            .padding(.horizontal, textPad)
 
                 Spacer().frame(height: 20)
 
