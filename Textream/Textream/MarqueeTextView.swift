@@ -103,6 +103,16 @@ struct WordItem: Identifiable {
     let word: String
     let charOffset: Int // char offset of this word in the full text (counting spaces)
     let isAnnotation: Bool // true for [bracket] words and emoji-only words
+    /// A word too wide for one line is split into parts on separate lines.
+    /// Each part keeps the word's id; `word` and `charOffset` cover the part.
+    var part: Int = 0
+    var isLastPart: Bool = true
+    var wordCharOffset: Int? = nil
+
+    var displayText: String {
+        if isLastPart { return word + " " }
+        return word.hasSuffix("-") ? word : word + "-"
+    }
 }
 
 // MARK: - Preference key to report word Y positions
@@ -218,9 +228,12 @@ struct SpeechScrollView: View {
                     recalculateTracking(containerHeight: containerHeight)
                 }
             }
-            .offset(y: scrollOffset + manualOffset)
-            .animation(scrollOffsetAnimation, value: scrollOffset)
-            .animation(.easeOut(duration: 0.15), value: manualOffset)
+            // Animate only the offsets. A value-based animation here would also
+            // animate the culling spacers inside the layout, so measured word
+            // positions drift for the length of the animation and far jumps
+            // and fast scrolls land on the wrong line.
+            .animation(.easeOut(duration: 0.15)) { $0.offset(y: manualOffset) }
+            .animation(scrollOffsetAnimation) { $0.offset(y: scrollOffset) }
             .onChange(of: geo.size.height) { _, newHeight in
                 containerHeight = newHeight
                 hasAppliedTrackingTarget = false
@@ -233,8 +246,7 @@ struct SpeechScrollView: View {
             .onChange(of: jumpRequestID) { _, _ in
                 manualOffset = 0
                 isUserScrolling = false
-                allowsNextBackwardTrackingUpdate = true
-                recalculateTracking(containerHeight: containerHeight)
+                recalculateTracking(containerHeight: containerHeight, force: true)
             }
             .onChange(of: highlightedCharCount) { _, _ in
                 if isListening && !smoothScroll && !isUserScrolling {
@@ -316,14 +328,8 @@ struct SpeechScrollView: View {
                             onManualScroll?(true, 0)
                         }
 
-                        let maxY = wordYPositions.values.max() ?? 0
-                        let containerHeight = geo.size.height
-                        let maxUp = containerHeight * 0.5
-                        let maxDown = max(0, maxY - containerHeight * 0.5)
-
+                        let (lowerBound, upperBound) = manualScrollBounds()
                         let newOffset = manualOffset + delta
-                        let upperBound = maxUp
-                        let lowerBound = -maxDown
 
                         if newOffset > upperBound {
                             let over = newOffset - upperBound
@@ -337,19 +343,24 @@ struct SpeechScrollView: View {
                     },
                     onScrollEnd: {
                         if isListening && isUserScrolling {
-                            // Find the word at the active tracking anchor.
-                            let newProgress = wordProgressAtCurrentOffset()
-                            withAnimation(.easeOut(duration: 0.15)) {
+                            // Settle any overscroll, then read from the word at the
+                            // tracking anchor. Fold the manual offset into the
+                            // scroll offset without animation so the text stays
+                            // exactly where the user left it.
+                            let (lowerBound, upperBound) = manualScrollBounds()
+                            var settle = Transaction()
+                            settle.disablesAnimations = true
+                            withTransaction(settle) {
+                                manualOffset = min(upperBound, max(lowerBound, manualOffset))
+                                scrollOffset += manualOffset
                                 manualOffset = 0
                             }
+                            let newProgress = wordProgressAtCurrentOffset()
                             isUserScrolling = false
                             allowsNextBackwardTrackingUpdate = true
                             onManualScroll?(false, newProgress)
                         } else {
-                            let maxY = wordYPositions.values.max() ?? 0
-                            let containerHeight = geo.size.height
-                            let upperBound = containerHeight * 0.5
-                            let lowerBound = -max(0, maxY - containerHeight * 0.5)
+                            let (lowerBound, upperBound) = manualScrollBounds()
 
                             if manualOffset > upperBound || manualOffset < lowerBound {
                                 withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
@@ -394,9 +405,9 @@ struct SpeechScrollView: View {
         }
     }
 
-    private func recalculateTracking(containerHeight: CGFloat) {
+    private func recalculateTracking(containerHeight: CGFloat, force: Bool = false) {
         if readingPosition == .nearTop {
-            recalcTopWithPreviousLine()
+            recalcTopWithPreviousLine(force: force)
             return
         }
 
@@ -411,18 +422,18 @@ struct SpeechScrollView: View {
             guard let wordY = wordYPositions[clampedIdx] else { return }
             let nextY = wordYPositions[clampedIdx + 1] ?? wordY
             let interpolatedY = wordY + (nextY - wordY) * CGFloat(fraction)
-            applyTrackingTarget(bottomAnchor - interpolatedY)
+            applyTrackingTarget(bottomAnchor - interpolatedY, force: force)
         } else {
             // Word-tracking/voice-activated: active word at vertical center
             let wordIdx = activeWordIndex()
             if let wordY = wordYPositions[wordIdx] {
                 let target = center - wordY
-                applyTrackingTarget(target)
+                applyTrackingTarget(target, force: force)
             }
         }
     }
 
-    private func recalcTopWithPreviousLine() {
+    private func recalcTopWithPreviousLine(force: Bool = false) {
         if smoothScroll {
             let wordIdx = Int(smoothWordProgress)
             let fraction = smoothWordProgress - Double(wordIdx)
@@ -431,12 +442,12 @@ struct SpeechScrollView: View {
             let nextY = wordYPositions[clampedIdx + 1] ?? wordY
             let interpolatedY = wordY + (nextY - wordY) * CGFloat(fraction)
             let target = min(interpolatedY, topReadingAnchor) - interpolatedY
-            applyTrackingTarget(target)
+            applyTrackingTarget(target, force: force)
         } else {
             let wordIdx = activeWordIndex()
             guard let wordY = wordYPositions[wordIdx] else { return }
             let target = min(wordY, topReadingAnchor) - wordY
-            applyTrackingTarget(target)
+            applyTrackingTarget(target, force: force)
         }
     }
 
@@ -525,15 +536,29 @@ struct SpeechScrollView: View {
     }
 
     /// Find the word progress at the current visual position (scrollOffset + manualOffset)
-    private func wordProgressAtCurrentOffset() -> Double {
-        let trackingY: CGFloat
+    /// The y position in the viewport where the active word is held.
+    /// Matches recalculateTracking: smooth modes anchor near the bottom.
+    private var trackingAnchorY: CGFloat {
         switch readingPosition {
         case .centered:
-            trackingY = containerHeight * 0.5
+            return smoothScroll ? containerHeight - 20 : containerHeight * 0.5
         case .nearTop:
-            trackingY = topReadingAnchor
+            return topReadingAnchor
         }
-        let targetY = trackingY - (scrollOffset + manualOffset)
+    }
+
+    /// How far the manual offset may go: from the first word at the anchor
+    /// to the last word at the anchor, measured from where the text is now.
+    private func manualScrollBounds() -> (lower: CGFloat, upper: CGFloat) {
+        let firstY = wordYPositions[0] ?? wordYPositions.values.min() ?? 0
+        let lastY = wordYPositions.values.max() ?? firstY
+        let upper = max(0, trackingAnchorY - firstY - scrollOffset)
+        let lower = min(0, trackingAnchorY - lastY - scrollOffset)
+        return (lower, upper)
+    }
+
+    private func wordProgressAtCurrentOffset() -> Double {
+        let targetY = trackingAnchorY - (scrollOffset + manualOffset)
 
         // Find the closest word and interpolate
         let sorted = wordYPositions.sorted { $0.key < $1.key }
@@ -601,6 +626,12 @@ struct WordFlowLayout: View {
     var scrollOffset: CGFloat = 0
     var viewportHeight: CGFloat = 0
 
+    /// Extra space before a new paragraph. Scales with the text so the break
+    /// still reads as a pause at large teleprompter sizes.
+    private var paragraphGap: CGFloat {
+        max(paragraphDividerExtraSpacing, (font.pointSize * 0.6).rounded())
+    }
+
     // Compute line spacing based on font metrics — fonts with large built-in
     // line height (e.g. OpenDyslexic) need less extra spacing
     private var lineSpacing: CGFloat {
@@ -615,15 +646,16 @@ struct WordFlowLayout: View {
     private static var _cachedItems: [WordItem] = []
     private static var _cachedLines: [[WordItem]] = []
     private static var _cachedParagraphPrefixCounts: [Int] = []
+    private static var _cachedPositions: [Int: CGFloat] = [:]
 
-    private func cachedLayout() -> ([WordItem], [[WordItem]], [Int]) {
+    private func cachedLayout() -> ([WordItem], [[WordItem]], [Int], [Int: CGFloat]) {
         let paragraphKey = paragraphBreakBeforeWordIndices.sorted()
             .map(String.init)
             .joined(separator: ",")
         let key = "\(words.count)|\(words.first ?? "")|\(words.last ?? "")|"
             + "\(font.fontName)|\(font.pointSize)|\(Int(containerWidth))|\(paragraphKey)"
         if key == Self._cacheKey {
-            return (Self._cachedItems, Self._cachedLines, Self._cachedParagraphPrefixCounts)
+            return (Self._cachedItems, Self._cachedLines, Self._cachedParagraphPrefixCounts, Self._cachedPositions)
         }
         let items = buildItems()
         let lines = buildLines(items: items)
@@ -640,7 +672,9 @@ struct WordFlowLayout: View {
         Self._cachedItems = items
         Self._cachedLines = lines
         Self._cachedParagraphPrefixCounts = paragraphPrefixCounts
-        return (items, lines, paragraphPrefixCounts)
+        let positions = layoutPositions(lines: lines, paragraphPrefixCounts: paragraphPrefixCounts)
+        Self._cachedPositions = positions
+        return (items, lines, paragraphPrefixCounts, positions)
     }
 
     // Find the index of the next word to read (first non-fully-lit, non-annotation word)
@@ -672,7 +706,9 @@ struct WordFlowLayout: View {
     }
 
     var body: some View {
-        let (items, lines, paragraphPrefixCounts) = cachedLayout()
+        // The cache is shared by every prompter view (notch and external),
+        // so keep this view's own layout values rather than reading the cache later.
+        let (items, lines, paragraphPrefixCounts, computedPositions) = cachedLayout()
         let nextIdx = nextWordIndex(items: items)
         let totalLines = lines.count
         let rtl = isRightToLeft(items: items)
@@ -682,12 +718,12 @@ struct WordFlowLayout: View {
         let lineH = rowHeight + lineSpacing
         let lineTop: (Int) -> CGFloat = { lineIndex in
             CGFloat(lineIndex) * lineH
-                + CGFloat(paragraphPrefixCounts[lineIndex]) * paragraphDividerExtraSpacing
+                + CGFloat(paragraphPrefixCounts[lineIndex]) * paragraphGap
         }
         let lineRowHeight: (Int) -> CGFloat = { lineIndex in
             let beginsParagraph = paragraphPrefixCounts[lineIndex + 1]
                 > paragraphPrefixCounts[lineIndex]
-            return rowHeight + (beginsParagraph ? paragraphDividerExtraSpacing : 0)
+            return rowHeight + (beginsParagraph ? paragraphGap : 0)
         }
         let totalContentHeight = max(0, lineTop(totalLines) - lineSpacing)
 
@@ -735,11 +771,11 @@ struct WordFlowLayout: View {
                 HStack(spacing: 0) {
                     ForEach(lines[lineIdx], id: \.id) { item in
                         wordView(for: item, isNextWord: item.id == nextIdx)
-                            .id(item.id)
+                            .id(item.id * 64 + item.part)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: rtl ? .trailing : .leading)
-                .padding(.top, beginsParagraph ? paragraphDividerExtraSpacing : 0)
+                .padding(.top, beginsParagraph ? paragraphGap : 0)
                 .overlay(alignment: .top) {
                     if beginsParagraph {
                         HStack(spacing: paragraphDividerDotSpacing) {
@@ -754,7 +790,7 @@ struct WordFlowLayout: View {
                         }
                             .offset(
                                 y: (
-                                    paragraphDividerExtraSpacing
+                                    paragraphGap
                                         - lineSpacing
                                         - paragraphDividerDotSize
                                 ) * 0.5
@@ -774,6 +810,29 @@ struct WordFlowLayout: View {
         }
         .frame(maxWidth: .infinity, alignment: rtl ? .trailing : .leading)
         .coordinateSpace(name: "flowLayout")
+        // Rendered words report measured positions. Culled words get their
+        // position from the layout model, so tracking and keyboard jumps can
+        // reach any word, not only the ones near the screen.
+        .transformPreference(WordYPreferenceKey.self) { value in
+            value.merge(computedPositions, uniquingKeysWith: { measured, _ in measured })
+        }
+    }
+
+    /// Vertical center of each word's first line, matching the VStack layout above.
+    private func layoutPositions(lines: [[WordItem]], paragraphPrefixCounts: [Int]) -> [Int: CGFloat] {
+        let rowHeight = ceil(font.ascender - font.descender + font.leading)
+        let lineH = rowHeight + lineSpacing
+        var positions: [Int: CGFloat] = [:]
+        for (lineIndex, line) in lines.enumerated() {
+            let beginsParagraph = paragraphPrefixCounts[lineIndex + 1] > paragraphPrefixCounts[lineIndex]
+            let top = CGFloat(lineIndex) * lineH
+                + CGFloat(paragraphPrefixCounts[lineIndex]) * paragraphGap
+                + (beginsParagraph ? paragraphGap : 0)
+            for item in line where item.part == 0 {
+                positions[item.id] = top + rowHeight / 2
+            }
+        }
+        return positions
     }
 
     private func wordView(for item: WordItem, isNextWord: Bool) -> some View {
@@ -790,20 +849,20 @@ struct WordFlowLayout: View {
                 ? cueColor.opacity(cueUnreadOpacity)
                 : highlightColor
 
-            return Text(item.word + " ")
+            return Text(item.displayText)
                 .font(item.isAnnotation ? Font(font).italic() : Font(font))
                 .foregroundStyle(uniformColor)
                 .background(
                     GeometryReader { wordGeo in
                         Color.clear.preference(
                             key: WordYPreferenceKey.self,
-                            value: [item.id: wordGeo.frame(in: .named("flowLayout")).midY]
+                            value: item.part == 0 ? [item.id: wordGeo.frame(in: .named("flowLayout")).midY] : [:]
                         )
                     }
                 )
                 .contentShape(Rectangle())
                 .onTapGesture {
-                    onWordTap?(item.charOffset)
+                    onWordTap?(item.wordCharOffset ?? item.charOffset)
                 }
         }
 
@@ -813,20 +872,20 @@ struct WordFlowLayout: View {
                 ? cueColor.opacity(cueReadOpacity)
                 : cueColor.opacity(cueUnreadOpacity)
 
-            return Text(item.word + " ")
+            return Text(item.displayText)
                 .font(Font(font).italic())
                 .foregroundStyle(annotationColor)
                 .background(
                     GeometryReader { wordGeo in
                         Color.clear.preference(
                             key: WordYPreferenceKey.self,
-                            value: [item.id: wordGeo.frame(in: .named("flowLayout")).midY]
+                            value: item.part == 0 ? [item.id: wordGeo.frame(in: .named("flowLayout")).midY] : [:]
                         )
                     }
                 )
                 .contentShape(Rectangle())
                 .onTapGesture {
-                    onWordTap?(item.charOffset)
+                    onWordTap?(item.wordCharOffset ?? item.charOffset)
                 }
         }
 
@@ -838,7 +897,7 @@ struct WordFlowLayout: View {
         // Base color for the whole word
         let wordColor: Color = isFullyLit ? highlightColor.opacity(0.3) : dimColor
 
-        return Text(item.word + " ")
+        return Text(item.displayText)
             .font(Font(font))
             .foregroundStyle(wordColor)
             .underline(isCurrentWord, color: wordColor)
@@ -846,13 +905,13 @@ struct WordFlowLayout: View {
                 GeometryReader { wordGeo in
                     Color.clear.preference(
                         key: WordYPreferenceKey.self,
-                        value: [item.id: wordGeo.frame(in: .named("flowLayout")).midY]
+                        value: item.part == 0 ? [item.id: wordGeo.frame(in: .named("flowLayout")).midY] : [:]
                     )
                 }
             )
             .contentShape(Rectangle())
             .onTapGesture {
-                onWordTap?(item.charOffset)
+                onWordTap?(item.wordCharOffset ?? item.charOffset)
             }
     }
 
@@ -889,6 +948,22 @@ struct WordFlowLayout: View {
                 currentLineWidth = 0
             }
             let wordWidth = (item.word as NSString).size(withAttributes: [.font: font]).width + spaceWidth
+            if containerWidth > 0 && wordWidth > containerWidth {
+                // Too wide for any line: break it with hyphens instead of truncating
+                if !lines[lines.count - 1].isEmpty {
+                    lines.append([])
+                }
+                let parts = Self.splitWord(item, maxWidth: containerWidth, font: font)
+                for (index, part) in parts.enumerated() {
+                    lines[lines.count - 1].append(part)
+                    if index < parts.count - 1 {
+                        lines.append([])
+                    }
+                }
+                let lastWidth = ((parts.last?.word ?? "") as NSString).size(withAttributes: [.font: font]).width
+                currentLineWidth = lastWidth + spaceWidth
+                continue
+            }
             if currentLineWidth + wordWidth > containerWidth && !lines[lines.count - 1].isEmpty {
                 lines.append([])
                 currentLineWidth = 0
@@ -897,6 +972,48 @@ struct WordFlowLayout: View {
             currentLineWidth += wordWidth
         }
         return lines
+    }
+
+    /// Greedily cut a word into parts that each fit `maxWidth` with a trailing hyphen.
+    static func splitWord(_ item: WordItem, maxWidth: CGFloat, font: NSFont) -> [WordItem] {
+        let characters = Array(item.word)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        func width(_ text: String) -> CGFloat {
+            (text as NSString).size(withAttributes: attributes).width
+        }
+        // Small safety margin so rounding never pushes a part past the edge
+        let limit = maxWidth - width(" ")
+        var parts: [WordItem] = []
+        var start = 0
+        while start < characters.count {
+            let remaining = String(characters[start...])
+            if width(remaining + " ") <= limit {
+                parts.append(WordItem(
+                    id: item.id, word: remaining, charOffset: item.charOffset + start,
+                    isAnnotation: item.isAnnotation, part: parts.count, isLastPart: true,
+                    wordCharOffset: item.charOffset
+                ))
+                break
+            }
+            var end = start + 1
+            while end < characters.count, width(String(characters[start...end]) + "-") <= limit {
+                end += 1
+            }
+            // Prefer breaking after a hyphen the word already has, unless
+            // that would leave this line less than half full
+            if end < characters.count,
+               let hyphen = characters[start..<end].lastIndex(of: "-"),
+               (hyphen - start) * 2 >= end - start {
+                end = hyphen + 1
+            }
+            parts.append(WordItem(
+                id: item.id, word: String(characters[start..<end]), charOffset: item.charOffset + start,
+                isAnnotation: item.isAnnotation, part: parts.count, isLastPart: false,
+                wordCharOffset: item.charOffset
+            ))
+            start = end
+        }
+        return parts
     }
 }
 
@@ -1002,18 +1119,30 @@ class ScrollWheelNSView: NSView {
                     let scaled = event.hasPreciseScrollingDeltas ? delta : delta * 10
                     self.onScroll?(scaled)
 
-                    if event.phase == .ended || event.momentumPhase == .ended {
-                        self.onScrollEnd?()
-                    } else if event.phase.isEmpty && event.momentumPhase.isEmpty {
+                    if event.momentumPhase.contains(.began) {
+                        // A glide follows the lift: wait for it to finish
                         self.wheelEndWorkItem?.cancel()
-                        let workItem = DispatchWorkItem { [weak self] in self?.onScrollEnd?() }
-                        self.wheelEndWorkItem = workItem
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+                    } else if event.momentumPhase.contains(.ended) || event.phase.contains(.cancelled) {
+                        self.wheelEndWorkItem?.cancel()
+                        self.onScrollEnd?()
+                    } else if event.phase.contains(.ended) {
+                        // Fingers lifted; end shortly unless a glide begins
+                        self.scheduleScrollEnd(after: 0.1)
+                    } else if event.phase.isEmpty && event.momentumPhase.isEmpty {
+                        // A mouse wheel sends no phases: a short pause ends it
+                        self.scheduleScrollEnd(after: 0.35)
                     }
                 }
                 return event
             }
         }
+    }
+
+    private func scheduleScrollEnd(after delay: TimeInterval) {
+        wheelEndWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in self?.onScrollEnd?() }
+        wheelEndWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     override func removeFromSuperview() {
